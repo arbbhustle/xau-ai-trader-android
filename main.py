@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from threading import Lock
+from time import time
 from typing import Any
 
 import pandas as pd
 import yfinance as yf
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 
-app = FastAPI(title="XAU AI Trader API", version="1.0.0")
+app = FastAPI(title="XAU AI Trader API", version="1.1.0")
 
-GOLD_TICKER = "GC=F"      # Gold futures proxy, not spot XAUUSD
+GOLD_TICKER = "GC=F"      # Gold futures proxy, not broker spot XAUUSD
 DXY_TICKER = "DX-Y.NYB"   # US Dollar Index
+
+CACHE_SECONDS = 90
+_cache_lock = Lock()
+_cache: dict[str, Any] = {"ts": 0.0, "signal": None}
 
 
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -46,30 +52,53 @@ def _session_name(now_utc: datetime) -> str:
     return "AFTER HOURS"
 
 
+def _safe_no_trade(reason: str) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    return {
+        "direction": "NO_TRADE",
+        "confidence": 0.0,
+        "buy_score": 0,
+        "sell_score": 0,
+        "entry": None,
+        "sl": None,
+        "tp1": None,
+        "tp2": None,
+        "dxy": "UNKNOWN",
+        "session": _session_name(now),
+        "mode": "DATA_UNAVAILABLE",
+        "action": "WAIT",
+        "timestamp_utc": now.isoformat(),
+        "source": "Yahoo Finance via yfinance",
+        "instrument_note": "GC=F gold futures proxy; not broker spot XAUUSD",
+        "warning": reason,
+    }
+
+
 def _download(ticker: str) -> pd.DataFrame:
     df = yf.download(
         ticker,
-        period="5d",
+        period="2d",
         interval="5m",
         auto_adjust=False,
         progress=False,
         threads=False,
+        timeout=8,
     )
+
     if df is None or df.empty:
         raise RuntimeError(f"No market data for {ticker}")
 
-    # yfinance may return MultiIndex columns even for one ticker.
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
 
     return df.dropna().copy()
 
 
-def build_signal() -> dict[str, Any]:
+def _build_live_signal() -> dict[str, Any]:
     gold = _download(GOLD_TICKER)
     dxy = _download(DXY_TICKER)
 
-    if len(gold) < 60 or len(dxy) < 20:
+    if len(gold) < 40 or len(dxy) < 20:
         raise RuntimeError("Not enough market history yet")
 
     gold["ema9"] = gold["Close"].ewm(span=9, adjust=False).mean()
@@ -95,19 +124,16 @@ def build_signal() -> dict[str, Any]:
     buy_score = 0
     sell_score = 0
 
-    # Trend
     if ema9 > ema21:
         buy_score += 30
     elif ema9 < ema21:
         sell_score += 30
 
-    # Price position
     if price > ema9:
         buy_score += 15
     elif price < ema9:
         sell_score += 15
 
-    # RSI regime
     if 52 <= rsi <= 72:
         buy_score += 20
     elif 28 <= rsi <= 48:
@@ -117,13 +143,11 @@ def build_signal() -> dict[str, Any]:
     elif rsi < 28:
         buy_score += 8
 
-    # Short momentum
     if momentum > 0:
         buy_score += 15
     elif momentum < 0:
         sell_score += 15
 
-    # DXY inverse relationship bias (heuristic)
     if dxy_bias == "BEARISH":
         buy_score += 20
     else:
@@ -176,6 +200,45 @@ def build_signal() -> dict[str, Any]:
     }
 
 
+def build_signal() -> dict[str, Any]:
+    now_ts = time()
+
+    with _cache_lock:
+        cached = _cache.get("signal")
+        cached_ts = float(_cache.get("ts", 0.0))
+        if cached is not None and (now_ts - cached_ts) < CACHE_SECONDS:
+            result = dict(cached)
+            result["cached"] = True
+            return result
+
+    try:
+        result = _build_live_signal()
+        result["cached"] = False
+
+        with _cache_lock:
+            _cache["signal"] = dict(result)
+            _cache["ts"] = now_ts
+
+        return result
+
+    except Exception as exc:
+        # IMPORTANT: never crash the API because a market-data provider
+        # rate-limits or times out. If an older successful signal exists,
+        # return it; otherwise return a safe NO_TRADE response.
+        with _cache_lock:
+            cached = _cache.get("signal")
+
+        if cached is not None:
+            result = dict(cached)
+            result["cached"] = True
+            result["warning"] = f"Live market data unavailable: {type(exc).__name__}: {exc}"
+            return result
+
+        return _safe_no_trade(
+            f"Live market data unavailable: {type(exc).__name__}: {exc}"
+        )
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     return {
@@ -192,7 +255,4 @@ def health() -> dict[str, str]:
 
 @app.get("/signal")
 def signal() -> dict[str, Any]:
-    try:
-        return build_signal()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Market data unavailable: {exc}")
+    return build_signal()
