@@ -1,25 +1,27 @@
-# XAU AI Strategy Engine v2 — Twelve Data
+# XAU AI Strategy Engine v2.1 — Demo Performance Tracker
 
-This version pulls XAU/USD OHLC candles from Twelve Data and analyzes them with the custom adaptive strategy engine.
+This version keeps the adaptive XAU/USD strategy engine and Twelve Data feed, and adds demo-trade tracking.
 
-## Render environment variable required
+## New endpoints
 
-`TWELVE_DATA_API_KEY=your_key_here`
+- `/signal` — live XAU/USD analysis and latest demo-trade state
+- `/performance` — win rate, wins/losses, total R, average R, open trade
+- `/trades` — open trade + recent closed demo trades
+- `POST /reset-demo` — clears demo tracker
+- `/market-status`
+- `/strategy`
+- `/history`
+- `/analyze`
 
-Optional defaults:
+## Demo tracking logic
 
-- `TWELVE_DATA_SYMBOL=XAU/USD`
-- `TWELVE_DATA_INTERVAL=5min`
-- `TWELVE_DATA_OUTPUTSIZE=120`
-- `MARKET_CACHE_SECONDS=60`
-- `PYTHON_VERSION=3.12.7`
+When the engine generates BUY or SELL and there is no open demo trade, it records Entry / SL / TP1 / TP2.
+On later market updates it checks new candles for SL and TP2. TP1 is marked when touched.
 
-## Endpoints
+For ambiguous candles that touch SL and TP in the same candle, the tracker uses a conservative assumption and counts SL first.
 
-- `/signal` — fetches/caches XAU/USD candles and returns the current analysis
-- `/market-status` — checks whether the API key is configured
-- `/strategy` — describes the engine
-- `/history` — recent generated signals
-- `/analyze` — manual candle testing/backtesting input
+## Important
 
-The engine remains demo/testing only. It does not guarantee profit.
+Render free instances can restart, so this in-memory demo history can reset. This is fine for the current test phase; persistent storage can be added later.
+
+This is testing software, not a guarantee of profit.

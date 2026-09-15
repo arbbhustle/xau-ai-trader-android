@@ -12,7 +12,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="XAU AI Strategy Engine", version="2.0.0")
+app = FastAPI(title="XAU AI Strategy Engine", version="2.1.0")
 
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 TWELVE_DATA_SYMBOL = os.getenv("TWELVE_DATA_SYMBOL", "XAU/USD").strip()
@@ -25,6 +25,139 @@ _MARKET_CACHE: Dict[str, Any] = {
     "candles": None,
     "meta": None,
 }
+
+
+# ----------------------------
+# Demo performance tracker
+# ----------------------------
+
+OPEN_TRADE: Optional[Dict[str, Any]] = None
+CLOSED_TRADES: Deque[Dict[str, Any]] = deque(maxlen=500)
+
+def _trade_id(signal: Dict[str, Any]) -> str:
+    return f"{signal.get('direction')}:{signal.get('entry')}:{signal.get('timestamp_utc')}"
+
+def maybe_open_demo_trade(signal: Dict[str, Any]) -> None:
+    global OPEN_TRADE
+    if signal.get("direction") not in ("BUY", "SELL"):
+        return
+    if signal.get("entry") is None or signal.get("sl") is None or signal.get("tp1") is None or signal.get("tp2") is None:
+        return
+    if OPEN_TRADE is not None:
+        return
+
+    OPEN_TRADE = {
+        "id": _trade_id(signal),
+        "direction": signal["direction"],
+        "entry": float(signal["entry"]),
+        "sl": float(signal["sl"]),
+        "tp1": float(signal["tp1"]),
+        "tp2": float(signal["tp2"]),
+        "opened_at": signal.get("timestamp_utc"),
+        "status": "OPEN",
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "closed_at": None,
+        "exit_price": None,
+        "result": None,
+        "r_multiple": 0.0,
+        "engine": signal.get("engine"),
+        "mode": signal.get("mode"),
+        "buy_score": signal.get("buy_score"),
+        "sell_score": signal.get("sell_score"),
+        "confidence": signal.get("confidence"),
+        "reasons": signal.get("reasons", []),
+    }
+
+def update_demo_trade(candles: List[Candle]) -> None:
+    global OPEN_TRADE
+    if OPEN_TRADE is None or not candles:
+        return
+
+    trade = OPEN_TRADE
+    entry = float(trade["entry"])
+    sl = float(trade["sl"])
+    tp1 = float(trade["tp1"])
+    tp2 = float(trade["tp2"])
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return
+
+    # Check only recent candles to avoid scanning everything repeatedly.
+    for c in candles[-20:]:
+        hi, lo = float(c.h), float(c.l)
+
+        if trade["direction"] == "BUY":
+            # Conservative ordering: if SL and TP touched in same candle, count SL first.
+            if lo <= sl:
+                trade["status"] = "CLOSED"
+                trade["result"] = "SL"
+                trade["exit_price"] = sl
+                trade["r_multiple"] = -1.0
+                break
+            if hi >= tp2:
+                trade["tp1_hit"] = True
+                trade["tp2_hit"] = True
+                trade["status"] = "CLOSED"
+                trade["result"] = "TP2"
+                trade["exit_price"] = tp2
+                trade["r_multiple"] = round((tp2 - entry) / risk, 2)
+                break
+            if hi >= tp1:
+                trade["tp1_hit"] = True
+
+        else:  # SELL
+            if hi >= sl:
+                trade["status"] = "CLOSED"
+                trade["result"] = "SL"
+                trade["exit_price"] = sl
+                trade["r_multiple"] = -1.0
+                break
+            if lo <= tp2:
+                trade["tp1_hit"] = True
+                trade["tp2_hit"] = True
+                trade["status"] = "CLOSED"
+                trade["result"] = "TP2"
+                trade["exit_price"] = tp2
+                trade["r_multiple"] = round((entry - tp2) / risk, 2)
+                break
+            if lo <= tp1:
+                trade["tp1_hit"] = True
+
+    if trade["status"] == "CLOSED":
+        trade["closed_at"] = datetime.now(timezone.utc).isoformat()
+        CLOSED_TRADES.appendleft(dict(trade))
+        OPEN_TRADE = None
+
+def performance_summary() -> Dict[str, Any]:
+    trades = list(CLOSED_TRADES)
+    total = len(trades)
+    wins = sum(1 for t in trades if t.get("result") in ("TP1", "TP2") or float(t.get("r_multiple", 0)) > 0)
+    losses = sum(1 for t in trades if t.get("result") == "SL")
+    total_r = round(sum(float(t.get("r_multiple", 0)) for t in trades), 2)
+    avg_r = round(total_r / total, 2) if total else 0.0
+    win_rate = round((wins / total) * 100, 1) if total else 0.0
+
+    streak = 0
+    best_streak = 0
+    for t in reversed(trades):
+        if float(t.get("r_multiple", 0)) > 0:
+            streak += 1
+            best_streak = max(best_streak, streak)
+        else:
+            streak = 0
+
+    return {
+        "closed_trades": total,
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": win_rate,
+        "total_r": total_r,
+        "average_r": avg_r,
+        "best_win_streak": best_streak,
+        "open_trade": OPEN_TRADE,
+        "note": "Demo tracker only. State resets if the Render instance restarts."
+    }
 
 # ----------------------------
 # Models
@@ -481,6 +614,15 @@ def build_live_signal() -> Dict[str, Any]:
         result["timeframe"] = TWELVE_DATA_INTERVAL
         result["market_source"] = "Twelve Data"
         result["data_status"] = "LIVE_DATA"
+
+        # First update any currently open demo trade with the newest candles,
+        # then optionally open a fresh trade from the new signal.
+        update_demo_trade(candles)
+        maybe_open_demo_trade(result)
+
+        result["demo_trade"] = OPEN_TRADE
+        result["performance"] = performance_summary()
+
         LATEST_SIGNAL = result
         HISTORY.appendleft(result)
         return result
@@ -512,11 +654,13 @@ def build_live_signal() -> Dict[str, Any]:
 def root():
     return {
         "name": "XAU AI Strategy Engine",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "status": "online",
         "signal_endpoint": "/signal",
         "analyze_endpoint": "/analyze",
         "history_endpoint": "/history",
+        "performance_endpoint": "/performance",
+        "trades_endpoint": "/trades",
     }
 
 @app.get("/health")
@@ -556,6 +700,27 @@ def market_status():
         "api_key_configured": bool(TWELVE_DATA_API_KEY),
         "cache_seconds": MARKET_CACHE_SECONDS,
     }
+
+
+@app.get("/performance")
+def performance():
+    return performance_summary()
+
+@app.get("/trades")
+def trades(limit: int = 50):
+    limit = max(1, min(limit, 500))
+    return {
+        "open_trade": OPEN_TRADE,
+        "closed_trades": list(CLOSED_TRADES)[:limit],
+    }
+
+@app.post("/reset-demo")
+def reset_demo():
+    global OPEN_TRADE
+    OPEN_TRADE = None
+    CLOSED_TRADES.clear()
+    HISTORY.clear()
+    return {"status": "reset", "message": "Demo history and performance were cleared."}
 
 @app.get("/strategy")
 def strategy():
