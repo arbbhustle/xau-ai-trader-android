@@ -1,46 +1,25 @@
+# XAU AI Strategy Engine v2 — Twelve Data
 
-# XAU AI Strategy Engine v1
+This version pulls XAU/USD OHLC candles from Twelve Data and analyzes them with the custom adaptive strategy engine.
 
-A lightweight demo strategy engine for XAUUSD.
+## Render environment variable required
 
-## What it does
-It does not depend on TradingView indicators or Yahoo Finance.
-It calculates its own features from OHLC candles:
+`TWELVE_DATA_API_KEY=your_key_here`
 
-- adaptive EMA geometry
-- trend slope
-- RSI momentum state
-- ATR
-- candle pressure
-- market structure
-- breakout pressure
-- efficiency ratio (trend vs noise)
-- volatility regime
-- dynamic Entry / SL / TP1 / TP2
+Optional defaults:
+
+- `TWELVE_DATA_SYMBOL=XAU/USD`
+- `TWELVE_DATA_INTERVAL=5min`
+- `TWELVE_DATA_OUTPUTSIZE=120`
+- `MARKET_CACHE_SECONDS=60`
+- `PYTHON_VERSION=3.12.7`
 
 ## Endpoints
 
-- `GET /` status
-- `GET /health`
-- `GET /signal` latest signal (compatible with the Android app)
-- `POST /analyze` send OHLC candles and receive a new signal
-- `GET /history`
-- `GET /strategy`
+- `/signal` — fetches/caches XAU/USD candles and returns the current analysis
+- `/market-status` — checks whether the API key is configured
+- `/strategy` — describes the engine
+- `/history` — recent generated signals
+- `/analyze` — manual candle testing/backtesting input
 
-## Example POST /analyze
-
-```json
-{
-  "symbol": "XAUUSD",
-  "timeframe": "5m",
-  "candles": [
-    {"t":"2026-09-15T00:00:00Z","o":3650.1,"h":3651.0,"l":3649.6,"c":3650.8}
-  ]
-}
-```
-
-At least 60 candles are required.
-
-## Important
-This is for demo/backtesting first. It does not guarantee profitable trading.
-A live market-data provider will be connected in the next step.
+The engine remains demo/testing only. It does not guarantee profit.

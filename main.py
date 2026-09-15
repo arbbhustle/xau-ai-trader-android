@@ -5,11 +5,26 @@ from collections import deque
 from datetime import datetime, timezone
 from math import fabs
 from typing import Any, Deque, Dict, List, Optional
+import os
+import time
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="XAU AI Strategy Engine", version="1.0.0")
+app = FastAPI(title="XAU AI Strategy Engine", version="2.0.0")
+
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+TWELVE_DATA_SYMBOL = os.getenv("TWELVE_DATA_SYMBOL", "XAU/USD").strip()
+TWELVE_DATA_INTERVAL = os.getenv("TWELVE_DATA_INTERVAL", "5min").strip()
+TWELVE_DATA_OUTPUTSIZE = int(os.getenv("TWELVE_DATA_OUTPUTSIZE", "120"))
+MARKET_CACHE_SECONDS = int(os.getenv("MARKET_CACHE_SECONDS", "60"))
+
+_MARKET_CACHE: Dict[str, Any] = {
+    "ts": 0.0,
+    "candles": None,
+    "meta": None,
+}
 
 # ----------------------------
 # Models
@@ -398,6 +413,97 @@ def score_engine(candles: List[Candle]) -> Dict[str, Any]:
         "engine": "XAU Adaptive Engine v1",
     }
 
+
+# ----------------------------
+# Twelve Data market feed
+# ----------------------------
+
+def fetch_twelve_data_candles() -> List[Candle]:
+    if not TWELVE_DATA_API_KEY:
+        raise RuntimeError("TWELVE_DATA_API_KEY is not configured in Render")
+
+    now_ts = time.time()
+    cached = _MARKET_CACHE.get("candles")
+    if cached and (now_ts - float(_MARKET_CACHE.get("ts", 0.0))) < MARKET_CACHE_SECONDS:
+        return cached
+
+    params = {
+        "symbol": TWELVE_DATA_SYMBOL,
+        "interval": TWELVE_DATA_INTERVAL,
+        "outputsize": str(TWELVE_DATA_OUTPUTSIZE),
+        "apikey": TWELVE_DATA_API_KEY,
+        "format": "JSON",
+    }
+
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get("https://api.twelvedata.com/time_series", params=params)
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Twelve Data HTTP {response.status_code}")
+
+    data = response.json()
+
+    if data.get("status") == "error":
+        raise RuntimeError(data.get("message") or "Twelve Data returned an error")
+
+    values = data.get("values") or []
+    if len(values) < 60:
+        raise RuntimeError(f"Not enough candles returned ({len(values)}); need at least 60")
+
+    # Twelve Data returns newest first; strategy engine expects oldest -> newest.
+    values = list(reversed(values))
+
+    candles: List[Candle] = []
+    for row in values:
+        candles.append(
+            Candle(
+                t=row.get("datetime"),
+                o=float(row["open"]),
+                h=float(row["high"]),
+                l=float(row["low"]),
+                c=float(row["close"]),
+                v=float(row["volume"]) if row.get("volume") not in (None, "") else None,
+            )
+        )
+
+    _MARKET_CACHE["ts"] = now_ts
+    _MARKET_CACHE["candles"] = candles
+    _MARKET_CACHE["meta"] = data.get("meta") or {}
+    return candles
+
+
+def build_live_signal() -> Dict[str, Any]:
+    global LATEST_SIGNAL
+    try:
+        candles = fetch_twelve_data_candles()
+        result = score_engine(candles)
+        result["symbol"] = TWELVE_DATA_SYMBOL
+        result["timeframe"] = TWELVE_DATA_INTERVAL
+        result["market_source"] = "Twelve Data"
+        result["data_status"] = "LIVE_DATA"
+        LATEST_SIGNAL = result
+        HISTORY.appendleft(result)
+        return result
+    except Exception as exc:
+        # Never crash the Android app. Return a safe WAIT response with the reason.
+        safe = dict(LATEST_SIGNAL)
+        safe["direction"] = "NO_TRADE"
+        safe["action"] = "WAIT"
+        safe["mode"] = "DATA_WAIT"
+        safe["confidence"] = 0.0
+        safe["buy_score"] = 0
+        safe["sell_score"] = 0
+        safe["entry"] = None
+        safe["sl"] = None
+        safe["tp1"] = None
+        safe["tp2"] = None
+        safe["reason"] = f"Market data unavailable: {type(exc).__name__}: {exc}"
+        safe["data_status"] = "ERROR"
+        safe["market_source"] = "Twelve Data"
+        safe["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
+        return safe
+
+
 # ----------------------------
 # API
 # ----------------------------
@@ -406,7 +512,7 @@ def score_engine(candles: List[Candle]) -> Dict[str, Any]:
 def root():
     return {
         "name": "XAU AI Strategy Engine",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "status": "online",
         "signal_endpoint": "/signal",
         "analyze_endpoint": "/analyze",
@@ -419,7 +525,7 @@ def health():
 
 @app.get("/signal")
 def signal():
-    return LATEST_SIGNAL
+    return build_live_signal()
 
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
@@ -439,6 +545,17 @@ def analyze(req: AnalyzeRequest):
 def history(limit: int = 30):
     limit = max(1, min(limit, 200))
     return list(HISTORY)[:limit]
+
+@app.get("/market-status")
+def market_status():
+    return {
+        "provider": "Twelve Data",
+        "symbol": TWELVE_DATA_SYMBOL,
+        "interval": TWELVE_DATA_INTERVAL,
+        "outputsize": TWELVE_DATA_OUTPUTSIZE,
+        "api_key_configured": bool(TWELVE_DATA_API_KEY),
+        "cache_seconds": MARKET_CACHE_SECONDS,
+    }
 
 @app.get("/strategy")
 def strategy():
